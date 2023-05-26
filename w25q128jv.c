@@ -3,7 +3,9 @@
 #include <linux/of.h>
 #include <linux/fs.h>
 #include <linux/blkdev.h>
+#include <linux/buffer_head.h>
 #include <linux/blk-mq.h>
+#include <linux/hdreg.h>
 
 #include "w25q128jv.h"
 
@@ -11,6 +13,7 @@ static int w25q128jv_open(struct block_device *dev, fmode_t mode);
 static void w25q128jv_release(struct gendisk *gdisk, fmode_t mode);
 int w25q128jv_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd, unsigned long arg);
 
+static blk_status_t handle_request(struct request *req, unsigned int *bytes_processed);
 static blk_status_t queue_request(struct blk_mq_hw_ctx *ctx, const struct blk_mq_queue_data *data);
 
 static int w25q128jv_probe(struct spi_device *client);
@@ -60,14 +63,53 @@ static void w25q128jv_release(struct gendisk *gdisk, fmode_t mode)
 {
 }
 
-int w25q128jv_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd, unsigned long arg)
+static blk_status_t handle_request(struct request *req, unsigned int *bytes_processed)
 {
-    return -ENOTTY;
+    blk_status_t status = BLK_STS_OK; /* BLK_STS_IOERR */
+    struct bio_vec vector;
+    struct req_iterator iterator;
+    struct device_data *dev_data = req->q->queuedata;
+    unsigned long seg_len;
+    void *seg_data;
+    loff_t pos;
+    loff_t dev_size = (loff_t)(W25Q128JV_CAPACITY << SECTOR_SHIFT);
+
+    pos = blk_rq_pos(req) << SECTOR_SHIFT;
+
+    /* go through all segments of request */
+    rq_for_each_segment(vector, req, iterator)
+    {
+        seg_data = page_address(vector.bv_page) + vector.bv_offset;
+        seg_len = vector.bv_len;
+
+        if((pos + seg_len) > dev_size)
+            seg_len = dev_size - pos;
+        
+        if(rq_data_dir(req) == WRITE)
+            memcpy(dev_data->buff + pos, seg_data, seg_len);
+        else
+            memcpy(seg_data, dev_data->buff + pos, seg_len);
+
+        pos += seg_len;
+        *bytes_processed += seg_len;
+    }
+
+    return status;
 }
 
+/* executed in atomic context */
 static blk_status_t queue_request(struct blk_mq_hw_ctx *ctx, const struct blk_mq_queue_data *data)
 {
-    return BLK_STS_OK;
+    unsigned int bytes_processed = 0;
+    blk_status_t req_status;
+    struct request *req = data->rq;
+
+    blk_mq_start_request(req);
+    req_status = handle_request(req, &bytes_processed);
+    blk_update_request(req, req_status, bytes_processed);
+    blk_mq_end_request(req, req_status);
+
+    return req_status;
 }
 
 static int w25q128jv_probe(struct spi_device *client)
@@ -82,6 +124,11 @@ static int w25q128jv_probe(struct spi_device *client)
     spi_set_drvdata(client, dev_data);
     dev_data->client = client;
 
+    /* temporary buffer for testing */
+    dev_data->buff = devm_kzalloc(&client->dev, W25Q128JV_CAPACITY, GFP_KERNEL);
+    if (!dev_data->buff)
+        return -ENOMEM;
+
     dev_data->tag_set.ops = &block_mq_ops;
 	dev_data->tag_set.nr_hw_queues = 1;
 	dev_data->tag_set.nr_maps = 1;
@@ -92,7 +139,7 @@ static int w25q128jv_probe(struct spi_device *client)
 	if (status)
         return status;
 
-    dev_data->disk = blk_mq_alloc_disk(&dev_data->tag_set, NULL);
+    dev_data->disk = blk_mq_alloc_disk(&dev_data->tag_set, dev_data);
     if (IS_ERR(dev_data->disk))
     {
         blk_mq_free_tag_set(&dev_data->tag_set);

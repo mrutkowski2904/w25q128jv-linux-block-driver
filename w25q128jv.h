@@ -7,13 +7,17 @@
 #include <linux/blk-mq.h>
 
 #define W25Q128JV_DISK_NAME "w25q128jv"
-#define W25Q128JV_SECTOR_SIZE 512
-#define W25Q128JV_SECTORS 32768
+#define W25Q128JV_SECTOR_SIZE 512UL
+/* #define W25Q128JV_SECTORS 32768UL */
+
+#define W25Q128JV_SECTORS 500UL
+
 /* 16 MiB */
 #define W25Q128JV_CAPACITY (W25Q128JV_SECTOR_SIZE * W25Q128JV_SECTORS)
 
 struct device_data
 {
+    u8 *buff;
     struct spi_device *client;
 
     struct gendisk *disk;
