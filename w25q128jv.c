@@ -6,6 +6,7 @@
 #include <linux/buffer_head.h>
 #include <linux/blk-mq.h>
 #include <linux/hdreg.h>
+#include <linux/delay.h>
 
 #include "w25q128jv.h"
 
@@ -65,30 +66,57 @@ static void w25q128jv_release(struct gendisk *gdisk, fmode_t mode)
 
 static blk_status_t handle_request(struct request *req, unsigned int *bytes_processed)
 {
-    blk_status_t status = BLK_STS_OK; /* BLK_STS_IOERR */
+    blk_status_t status = BLK_STS_OK;
     struct bio_vec vector;
     struct req_iterator iterator;
     struct device_data *dev_data = req->q->queuedata;
     unsigned long seg_len;
     void *seg_data;
     loff_t pos;
-    loff_t dev_size = (loff_t)(W25Q128JV_CAPACITY << SECTOR_SHIFT);
+    loff_t dev_size = (loff_t)(W25Q128JV_SECTORS * W25Q128JV_SECTOR_SIZE);
 
+    /* blk_rq_pos(req) - 512 byte sector of request */
     pos = blk_rq_pos(req) << SECTOR_SHIFT;
+
+    /* non FS request */
+    if (blk_rq_is_passthrough(req))
+    {
+        status = BLK_STS_IOERR;
+        return status;
+    }
+
+    /*
+    pr_info("------------------\nw25q128jv: request, sector: %llu, addr: %llu, all bytes: %llu\n", blk_rq_pos(req), pos, blk_rq_bytes(req));
+    */
 
     /* go through all segments of request */
     rq_for_each_segment(vector, req, iterator)
     {
+        /* !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
+        /* TMP: DEBUGGING */
+        /* remove delay include after removing this call */
+        mdelay(msecs_to_jiffies(140));
+
         seg_data = page_address(vector.bv_page) + vector.bv_offset;
         seg_len = vector.bv_len;
 
-        if((pos + seg_len) > dev_size)
+        if ((pos + seg_len) > dev_size)
             seg_len = dev_size - pos;
-        
-        if(rq_data_dir(req) == WRITE)
+
+        if (rq_data_dir(req) == WRITE)
+        {
+            /*
+            pr_info("w25q128jv: seg write, pos: %llu, size: %llu\n", pos, seg_len);
+            */
             memcpy(dev_data->buff + pos, seg_data, seg_len);
+        }
         else
+        {
+            /*
+            pr_info("w25q128jv: seg read, pos: %llu, size: %llu\n", pos, seg_len);
+            */
             memcpy(seg_data, dev_data->buff + pos, seg_len);
+        }
 
         pos += seg_len;
         *bytes_processed += seg_len;
@@ -100,16 +128,15 @@ static blk_status_t handle_request(struct request *req, unsigned int *bytes_proc
 /* executed in atomic context */
 static blk_status_t queue_request(struct blk_mq_hw_ctx *ctx, const struct blk_mq_queue_data *data)
 {
+    blk_status_t status;
     unsigned int bytes_processed = 0;
-    blk_status_t req_status;
     struct request *req = data->rq;
 
     blk_mq_start_request(req);
-    req_status = handle_request(req, &bytes_processed);
-    blk_update_request(req, req_status, bytes_processed);
-    blk_mq_end_request(req, req_status);
-
-    return req_status;
+    status = handle_request(req, &bytes_processed);
+    blk_update_request(req, status, bytes_processed);
+    blk_mq_end_request(req, status);
+    return status;
 }
 
 static int w25q128jv_probe(struct spi_device *client)
@@ -125,26 +152,29 @@ static int w25q128jv_probe(struct spi_device *client)
     dev_data->client = client;
 
     /* temporary buffer for testing */
-    dev_data->buff = devm_kzalloc(&client->dev, W25Q128JV_CAPACITY, GFP_KERNEL);
+    dev_data->buff = devm_kzalloc(&client->dev, W25Q128JV_SECTORS * W25Q128JV_SECTOR_SIZE, GFP_KERNEL);
     if (!dev_data->buff)
         return -ENOMEM;
 
     dev_data->tag_set.ops = &block_mq_ops;
-	dev_data->tag_set.nr_hw_queues = 1;
-	dev_data->tag_set.nr_maps = 1;
-	dev_data->tag_set.queue_depth = 16;
-	dev_data->tag_set.numa_node = NUMA_NO_NODE;
-	dev_data->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+    dev_data->tag_set.nr_hw_queues = 1;
+    dev_data->tag_set.nr_maps = 1;
+    dev_data->tag_set.queue_depth = 16;
+    dev_data->tag_set.numa_node = NUMA_NO_NODE;
+    dev_data->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
     status = blk_mq_alloc_tag_set(&dev_data->tag_set);
-	if (status)
+    if (status)
         return status;
 
     dev_data->disk = blk_mq_alloc_disk(&dev_data->tag_set, dev_data);
     if (IS_ERR(dev_data->disk))
     {
         blk_mq_free_tag_set(&dev_data->tag_set);
-		return PTR_ERR(dev_data->disk);
+        return PTR_ERR(dev_data->disk);
     }
+    blk_queue_physical_block_size(dev_data->disk->queue, W25Q128JV_SECTOR_SIZE);
+    blk_queue_max_segments(dev_data->disk->queue, 1);
+    blk_queue_io_min(dev_data->disk->queue, W25Q128JV_SECTOR_SIZE);
 
     dev_data->disk->flags |= GENHD_FL_NO_PART;
     dev_data->disk->major = drv_data.major;
@@ -153,10 +183,10 @@ static int w25q128jv_probe(struct spi_device *client)
     dev_data->disk->fops = &block_dev_ops;
     dev_data->disk->private_data = dev_data;
     sprintf(dev_data->disk->disk_name, W25Q128JV_DISK_NAME);
-    set_capacity(dev_data->disk, W25Q128JV_CAPACITY);
+    set_capacity(dev_data->disk, W25Q128JV_SECTORS * (W25Q128JV_SECTOR_SIZE / SECTOR_SIZE));
 
     status = add_disk(dev_data->disk);
-    if(status)
+    if (status)
     {
         blk_mq_free_tag_set(&dev_data->tag_set);
         put_disk(dev_data->disk);
@@ -171,9 +201,9 @@ static int w25q128jv_probe(struct spi_device *client)
 static void w25q128jv_remove(struct spi_device *client)
 {
     struct device_data *dev_data;
-	dev_data = spi_get_drvdata(client);
+    dev_data = spi_get_drvdata(client);
 
-    if(dev_data->disk)
+    if (dev_data->disk)
     {
         del_gendisk(dev_data->disk);
         blk_mq_free_tag_set(&dev_data->tag_set);
