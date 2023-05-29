@@ -10,6 +10,7 @@
 #include <linux/math.h>
 
 /* command map */
+#define W25Q128JV_CMD_PAGE_PROGRAM 0x02
 #define W25Q128JV_CMD_READ_DATA 0x03
 #define W25Q128JV_CMD_STATUS_1 0x05
 #define W25Q128JV_CMD_WE 0x06
@@ -22,6 +23,7 @@
 
 #define W25Q128JV_DISK_NAME "w25q128jv"
 #define W25Q128JV_SECTOR_SIZE 4096UL
+#define W25Q128JV_WRITE_PAGE_SIZE 256UL
 
 /* 1MiB */
 #define W25Q128JV_SECTORS 256UL
@@ -47,8 +49,10 @@ struct driver_data
 static bool w25q128jv_is_id_ok(struct device_data *dev_data);
 static int w25q128jv_wait_until_ready(struct device_data *dev_data);
 static int w25q128jv_write_enable(struct device_data *dev_data);
-static int w25q128jv_erase_sector(struct device_data *dev_data, u32 addr);
+static int w25q128jv_erase_sector(struct device_data *dev_data, u32 sector_addr);
 static int w25q128jv_read_data(struct device_data *dev_data, u32 addr, void *out, size_t len);
+static int w25q128jv_read_sector(struct device_data *dev_data, u32 sector_addr, void *out);
+static int w25q128jv_write_sector(struct device_data *dev_data, u32 sector_addr, void *in);
 
 /* helper function to copy flash address to spi buffer */
 static void w25q128jv_addr_to_buff(u32 addr, u8 *buff);
@@ -210,6 +214,65 @@ static int w25q128jv_read_data(struct device_data *dev_data, u32 addr, void *out
     return spi_sync(dev_data->client, &read_sector_message);
 }
 
+static int w25q128jv_read_sector(struct device_data *dev_data, u32 sector_addr, void *out)
+{
+    u32 aligned_addr = round_down(sector_addr, W25Q128JV_SECTOR_SIZE);
+    return w25q128jv_read_data(dev_data, aligned_addr, out, W25Q128JV_SECTOR_SIZE);
+}
+
+static int w25q128jv_write_sector(struct device_data *dev_data, u32 sector_addr, void *in)
+{
+    int status;
+    void *data_ptr;
+    u8 cmd;
+    u8 addr_buff[3];
+    struct spi_message write_page_message;
+    struct spi_transfer transfers[3];
+
+    u32 aligned_addr = round_down(sector_addr, W25Q128JV_SECTOR_SIZE);
+    
+    status = w25q128jv_erase_sector(dev_data, aligned_addr);
+    if(status)
+        return status;
+
+    data_ptr = in;
+    for(int i = 0; i < (W25Q128JV_SECTOR_SIZE / W25Q128JV_WRITE_PAGE_SIZE); i++)
+    {
+        status = w25q128jv_wait_until_ready(dev_data);
+        if(status)
+            return status;
+
+        status = w25q128jv_write_enable(dev_data);
+        if(status)
+            return status;
+
+        cmd = W25Q128JV_CMD_PAGE_PROGRAM;
+        w25q128jv_addr_to_buff(aligned_addr, addr_buff);
+        /* when programming whole page, LSB should be 0 according to datasheet */
+        addr_buff[0] = 0x00;
+        memset(transfers, 0, 3 * sizeof(struct spi_transfer));
+        
+        transfers[0].tx_buf = &cmd;
+        transfers[0].len = 1;
+        transfers[1].tx_buf = addr_buff;
+        transfers[1].len = 3;
+        transfers[2].tx_buf = data_ptr;
+        transfers[2].len = W25Q128JV_WRITE_PAGE_SIZE;
+
+        spi_message_init(&write_page_message);
+        for(int i = 0; i < 3; i++)
+            spi_message_add_tail(&transfers[i], &write_page_message);
+
+        status = spi_sync(dev_data->client, &write_page_message);
+        if(status)
+            return status;
+
+        data_ptr += W25Q128JV_WRITE_PAGE_SIZE;
+        aligned_addr += W25Q128JV_WRITE_PAGE_SIZE;
+    }
+    return 0;
+}
+
 static void w25q128jv_addr_to_buff(u32 addr, u8 *buff)
 {
     buff[0] = (addr >> 0) & 0xff;
@@ -315,12 +378,6 @@ static int w25q128jv_probe(struct spi_device *client)
     if(!w25q128jv_is_id_ok(dev_data))
     {
         dev_err(&client->dev, "invalid manufacturer id\n");
-        return -EINVAL;
-    }
-
-    if(w25q128jv_erase_sector(dev_data, 4098))
-    {
-        dev_err(&client->dev, "erasing sector failed\n");
         return -EINVAL;
     }
 
