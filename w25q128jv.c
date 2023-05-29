@@ -6,13 +6,39 @@
 #include <linux/buffer_head.h>
 #include <linux/blk-mq.h>
 #include <linux/hdreg.h>
-#include <linux/delay.h>
 
-#include "w25q128jv.h"
+/* register map */
+#define W25Q128JV_REG_ID 0x90
+
+#define W25Q128JV_REG_ID_MANUFACTURER_EXPECTED_VAL 0xEF
+
+#define W25Q128JV_DISK_NAME "w25q128jv"
+#define W25Q128JV_SECTOR_SIZE 4096UL
+
+/* 1MiB */
+#define W25Q128JV_SECTORS 256UL
+
+struct device_data
+{
+    u8 *buff;
+    struct spi_device *client;
+
+    struct gendisk *disk;
+    struct blk_mq_tag_set tag_set;
+    struct request_queue *req_queue;
+};
+
+struct driver_data
+{
+    int major;
+    int device_no;
+};
+
+/* hardware io */
+static bool w25q128jv_is_id_ok(struct device_data *dev_data);
 
 static int w25q128jv_open(struct block_device *dev, fmode_t mode);
 static void w25q128jv_release(struct gendisk *gdisk, fmode_t mode);
-int w25q128jv_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd, unsigned long arg);
 
 static blk_status_t handle_request(struct request *req, unsigned int *bytes_processed);
 static blk_status_t queue_request(struct blk_mq_hw_ctx *ctx, const struct blk_mq_queue_data *data);
@@ -53,7 +79,42 @@ static struct blk_mq_ops block_mq_ops = {
     .queue_rq = queue_request,
 };
 
+/* driver wide data */
 struct driver_data drv_data;
+
+static bool w25q128jv_is_id_ok(struct device_data *dev_data)
+{
+    struct spi_message id_read_message;
+    struct spi_transfer transfers[3];
+    u8 cmd;
+    u8 addr[3];
+    u8 in[2];
+
+    cmd = W25Q128JV_REG_ID;
+    memset(addr, 0, 3);
+    memset(transfers, 0, 3 * sizeof(struct spi_transfer));
+
+    transfers[0].tx_buf = &cmd;
+    transfers[0].len = 1;
+
+    transfers[1].tx_buf = addr;
+    transfers[1].len = 3;
+
+    transfers[2].rx_buf = in;
+    transfers[2].len = 2;
+
+    spi_message_init(&id_read_message);
+    for(int i = 0; i < 3; i++)
+        spi_message_add_tail(&transfers[i], &id_read_message);
+
+    if(spi_sync(dev_data->client, &id_read_message))
+    {
+        dev_err(&dev_data->client->dev, "spi transfer error, status: %d\n", id_read_message.status);
+        return false;
+    }
+
+    return (in[0] == W25Q128JV_REG_ID_MANUFACTURER_EXPECTED_VAL);
+}
 
 static int w25q128jv_open(struct block_device *dev, fmode_t mode)
 {
@@ -92,11 +153,6 @@ static blk_status_t handle_request(struct request *req, unsigned int *bytes_proc
     /* go through all segments of request */
     rq_for_each_segment(vector, req, iterator)
     {
-        /* !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
-        /* TMP: DEBUGGING */
-        /* remove delay include after removing this call */
-        mdelay(msecs_to_jiffies(140));
-
         seg_data = page_address(vector.bv_page) + vector.bv_offset;
         seg_len = vector.bv_len;
 
@@ -105,16 +161,12 @@ static blk_status_t handle_request(struct request *req, unsigned int *bytes_proc
 
         if (rq_data_dir(req) == WRITE)
         {
-            /*
-            pr_info("w25q128jv: seg write, pos: %llu, size: %llu\n", pos, seg_len);
-            */
+            /* pr_info("w25q128jv: seg write, pos: %llu, size: %llu\n", pos, seg_len); */
             memcpy(dev_data->buff + pos, seg_data, seg_len);
         }
         else
         {
-            /*
-            pr_info("w25q128jv: seg read, pos: %llu, size: %llu\n", pos, seg_len);
-            */
+            /* pr_info("w25q128jv: seg read, pos: %llu, size: %llu\n", pos, seg_len); */
             memcpy(seg_data, dev_data->buff + pos, seg_len);
         }
 
@@ -125,7 +177,6 @@ static blk_status_t handle_request(struct request *req, unsigned int *bytes_proc
     return status;
 }
 
-/* executed in atomic context */
 static blk_status_t queue_request(struct blk_mq_hw_ctx *ctx, const struct blk_mq_queue_data *data)
 {
     blk_status_t status;
@@ -156,12 +207,18 @@ static int w25q128jv_probe(struct spi_device *client)
     if (!dev_data->buff)
         return -ENOMEM;
 
+    if(!w25q128jv_is_id_ok(dev_data))
+    {
+        dev_err(&client->dev, "invalid manufacturer id\n");
+        return -EINVAL;
+    }
+
     dev_data->tag_set.ops = &block_mq_ops;
     dev_data->tag_set.nr_hw_queues = 1;
     dev_data->tag_set.nr_maps = 1;
     dev_data->tag_set.queue_depth = 16;
     dev_data->tag_set.numa_node = NUMA_NO_NODE;
-    dev_data->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+    dev_data->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_BLOCKING;
     status = blk_mq_alloc_tag_set(&dev_data->tag_set);
     if (status)
         return status;
