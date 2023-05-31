@@ -21,7 +21,7 @@
 			w25q128jv: w25q128jv@0 {
 				compatible = "mr,custom_w25q128jv";
 				reg = <0x0>;
-				spi-max-frequency = <8000>;
+				spi-max-frequency = <500000>;
 				spi-bits-per-word = <8>;
 				status = "okay";
 			};

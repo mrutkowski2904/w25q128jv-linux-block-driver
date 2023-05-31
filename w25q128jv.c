@@ -10,27 +10,24 @@
 #include <linux/math.h>
 
 /* command map */
-#define W25Q128JV_CMD_PAGE_PROGRAM 0x02
-#define W25Q128JV_CMD_READ_DATA 0x03
-#define W25Q128JV_CMD_STATUS_1 0x05
-#define W25Q128JV_CMD_WE 0x06
-#define W25Q128JV_CMD_ERASE_SECTOR 0x20
-#define W25Q128JV_CMD_ID 0x90
+#define W25Q128JV_CMD_PAGE_PROGRAM                  0x02
+#define W25Q128JV_CMD_READ_DATA                     0x03
+#define W25Q128JV_CMD_STATUS_1                      0x05
+#define W25Q128JV_CMD_WE                            0x06
+#define W25Q128JV_CMD_ERASE_SECTOR                  0x20
+#define W25Q128JV_CMD_ID                            0x90
 
-#define W25Q128JV_CMD_STATUS_1_BUSY_FLAG (1 << 0)
-#define W25Q128JV_CMD_ID_MANUFACTURER_EXPECTED_VAL 0xEF
-#define W25Q128JV_WAIT_UNTIL_READY_MAX_RETRIES 20
+#define W25Q128JV_CMD_STATUS_1_BUSY_FLAG            (1 << 0)
+#define W25Q128JV_CMD_ID_MANUFACTURER_EXPECTED_VAL  0xEF
+#define W25Q128JV_WAIT_UNTIL_READY_MAX_RETRIES      20
 
-#define W25Q128JV_DISK_NAME "w25q128jv"
-#define W25Q128JV_SECTOR_SIZE 4096UL
-#define W25Q128JV_WRITE_PAGE_SIZE 256UL
-
-/* 1MiB */
-#define W25Q128JV_SECTORS 256UL
+#define W25Q128JV_DISK_NAME                         "w25q128jv"
+#define W25Q128JV_SECTOR_SIZE                       4096UL
+#define W25Q128JV_WRITE_PAGE_SIZE                   256UL
+#define W25Q128JV_SECTORS                           4096UL
 
 struct device_data
 {
-    u8 *buff;
     u8 *sector_buff;
     struct spi_device *client;
 
@@ -53,6 +50,7 @@ static int w25q128jv_erase_sector(struct device_data *dev_data, u32 sector_addr)
 static int w25q128jv_read_data(struct device_data *dev_data, u32 addr, void *out, size_t len);
 static int w25q128jv_read_sector(struct device_data *dev_data, u32 sector_addr, void *out);
 static int w25q128jv_write_sector(struct device_data *dev_data, u32 sector_addr, void *in);
+static int w25q128jv_write_data(struct device_data *dev_data, u32 addr, void *in, size_t len);
 
 /* helper function to copy flash address to spi buffer */
 static void w25q128jv_addr_to_buff(u32 addr, u8 *buff);
@@ -273,6 +271,42 @@ static int w25q128jv_write_sector(struct device_data *dev_data, u32 sector_addr,
     return 0;
 }
 
+static int w25q128jv_write_data(struct device_data *dev_data, u32 addr, void *in, size_t len)
+{
+    int status;
+    u32 sector_addr, sector_offset;
+
+    if(len == W25Q128JV_WRITE_PAGE_SIZE)
+    {
+        status = w25q128jv_erase_sector(dev_data, addr);
+        if(status)
+            return status;
+        status = w25q128jv_write_sector(dev_data, addr, in);
+        return status;
+    }
+
+    sector_addr = round_down(addr, W25Q128JV_SECTOR_SIZE);
+    sector_offset = addr - sector_addr;
+
+    if((sector_offset + len) > W25Q128JV_SECTOR_SIZE)
+    {
+        dev_err(&dev_data->client->dev, "attempt to write past sector boundary\n");
+        return -EINVAL;
+    }
+
+    status = w25q128jv_read_sector(dev_data, addr, dev_data->sector_buff);
+    if(status)
+        return status;
+
+    status = w25q128jv_erase_sector(dev_data, addr);
+    if(status)
+        return status;
+    
+    memcpy(dev_data->sector_buff + sector_offset, in, len);
+    status = w25q128jv_write_sector(dev_data, addr, dev_data->sector_buff);
+    return status;
+}
+
 static void w25q128jv_addr_to_buff(u32 addr, u8 *buff)
 {
     buff[0] = (addr >> 0) & 0xff;
@@ -291,7 +325,6 @@ static void w25q128jv_release(struct gendisk *gdisk, fmode_t mode)
 
 static blk_status_t handle_request(struct request *req, unsigned int *bytes_processed)
 {
-    blk_status_t status = BLK_STS_OK;
     struct bio_vec vector;
     struct req_iterator iterator;
     struct device_data *dev_data = req->q->queuedata;
@@ -305,14 +338,7 @@ static blk_status_t handle_request(struct request *req, unsigned int *bytes_proc
 
     /* non FS request */
     if (blk_rq_is_passthrough(req))
-    {
-        status = BLK_STS_IOERR;
-        return status;
-    }
-
-    /*
-    pr_info("------------------\nw25q128jv: request, sector: %llu, addr: %llu, all bytes: %llu\n", blk_rq_pos(req), pos, blk_rq_bytes(req));
-    */
+        return BLK_STS_IOERR;
 
     /* go through all segments of request */
     rq_for_each_segment(vector, req, iterator)
@@ -325,20 +351,19 @@ static blk_status_t handle_request(struct request *req, unsigned int *bytes_proc
 
         if (rq_data_dir(req) == WRITE)
         {
-            /* pr_info("w25q128jv: seg write, pos: %llu, size: %llu\n", pos, seg_len); */
-            memcpy(dev_data->buff + pos, seg_data, seg_len);
+            if(w25q128jv_write_data(dev_data, pos, seg_data, seg_len))
+                return BLK_STS_IOERR;
         }
         else
         {
-            /* pr_info("w25q128jv: seg read, pos: %llu, size: %llu\n", pos, seg_len); */
-            memcpy(seg_data, dev_data->buff + pos, seg_len);
+            if(w25q128jv_read_data(dev_data, pos, seg_data, seg_len))
+                    return BLK_STS_IOERR;
         }
-
+        
         pos += seg_len;
         *bytes_processed += seg_len;
     }
-
-    return status;
+    return BLK_STS_OK;
 }
 
 static blk_status_t queue_request(struct blk_mq_hw_ctx *ctx, const struct blk_mq_queue_data *data)
@@ -365,11 +390,6 @@ static int w25q128jv_probe(struct spi_device *client)
 
     spi_set_drvdata(client, dev_data);
     dev_data->client = client;
-
-    /* temporary buffer for testing */
-    dev_data->buff = devm_kzalloc(&client->dev, W25Q128JV_SECTORS * W25Q128JV_SECTOR_SIZE, GFP_KERNEL);
-    if (!dev_data->buff)
-        return -ENOMEM;
 
     dev_data->sector_buff = devm_kzalloc(&client->dev, W25Q128JV_SECTOR_SIZE, GFP_KERNEL);
     if (!dev_data->sector_buff)
@@ -460,4 +480,4 @@ module_exit(w25q128jv_driver_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Rutkowski");
-MODULE_DESCRIPTION("SPI driver for ILI9341 display");
+MODULE_DESCRIPTION("SPI driver for W25Q128JV flash memory");
