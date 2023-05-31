@@ -8,7 +8,7 @@ Overview:
 * Exposed to userspace as `/dev/w25q128jv`
 
 ## Demo
-![mounting disk and saving file](img/demo5.gif)
+![mounting disk and saving file](img/demo6.gif)
 <br>
 ![connected to RPi](img/connected.jpg)
 
